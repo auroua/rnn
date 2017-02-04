@@ -34,7 +34,7 @@ if __name__ == '__main__':
     index_to_word.append(unknown_token)
     word_to_index = dict([(w, i) for i, w in enumerate(index_to_word)])
     print("Using vocabulary size %d." % vocabulary_size)
-    print("The least frequent word in our vocabulary is '%s' and appeared %d times." % (vocab[-1][0], vocab[-1][1]))
+    print("The most frequent word in our vocabulary is '%s' and appeared %d times." % (vocab[0][0], vocab[0][1]))
 
     # Replace all words not in our vocabulary with the unknown token
     for i, sent in enumerate(tokenized_sentences):
@@ -47,5 +47,5 @@ if __name__ == '__main__':
     X_train = np.asarray([[word_to_index[w] for w in sent[:-1]] for sent in tokenized_sentences])
     y_train = np.asarray([[word_to_index[w] for w in sent[1:]] for sent in tokenized_sentences])
 
-    np.save('../data/rnn_1/x_train', X_train)
-    np.save('../data/rnn_1/y_train', y_train)
+    # np.save('../data/rnn_1/x_train', X_train)
+    # np.save('../data/rnn_1/y_train', y_train)
