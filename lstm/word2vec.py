@@ -27,6 +27,251 @@ import numpy as np
 from six.moves import urllib
 from six.moves import xrange  # pylint: disable=redefined-builtin
 import tensorflow as tf
+from tensorflow.python.framework import constant_op
+from tensorflow.python.framework import dtypes
+from tensorflow.python.framework import ops
+from tensorflow.python.framework import tensor_shape
+from tensorflow.python.ops import array_ops
+from tensorflow.python.ops import candidate_sampling_ops
+from tensorflow.python.ops import control_flow_ops
+from tensorflow.python.ops import embedding_ops
+from tensorflow.python.ops import sparse_ops
+
+
+# Bring more nn-associated functionality into this package.
+# go/tf-wildcard-import
+# pylint: disable=wildcard-import
+from tensorflow.python.ops.nn_ops import *
+from tensorflow.python.ops.rnn import *
+
+
+def _compute_sampled_logits(weights,
+                            biases,
+                            inputs,
+                            labels,
+                            num_sampled,
+                            num_classes,
+                            num_true=1,
+                            sampled_values=None,
+                            subtract_log_q=True,
+                            remove_accidental_hits=False,
+                            partition_strategy="mod",
+                            name=None):
+
+  if not isinstance(weights, list):
+    weights = [weights]
+
+  with ops.name_scope(name, "compute_sampled_logits",
+                      weights + [biases, inputs, labels]):
+    if labels.dtype != dtypes.int64:
+      labels = math_ops.cast(labels, dtypes.int64)
+    labels_flat = array_ops.reshape(labels, [-1])
+    # Sample the negative labels.
+    #   sampled shape: [num_sampled] tensor
+    #   true_expected_count shape = [batch_size, 1] tensor
+    #   sampled_expected_count shape = [num_sampled] tensor
+    if sampled_values is None:
+      sampled_values = candidate_sampling_ops.log_uniform_candidate_sampler(
+          true_classes=labels,
+          num_true=num_true,
+          num_sampled=num_sampled,
+          unique=True,
+          range_max=num_classes)
+    # NOTE: pylint cannot tell that 'sampled_values' is a sequence
+    # pylint: disable=unpacking-non-sequence
+    sampled, true_expected_count, sampled_expected_count = sampled_values
+    # pylint: enable=unpacking-non-sequence
+
+    # labels_flat is a [batch_size * num_true] tensor
+    # sampled is a [num_sampled] int tensor
+    all_ids = array_ops.concat(0, [labels_flat, sampled])
+
+    # weights shape is [num_classes, dim]
+    all_w = embedding_ops.embedding_lookup(
+        weights, all_ids, partition_strategy=partition_strategy)
+    all_b = embedding_ops.embedding_lookup(biases, all_ids)
+    # true_w shape is [batch_size * num_true, dim]
+    # true_b is a [batch_size * num_true] tensor
+    true_w = array_ops.slice(
+        all_w, [0, 0], array_ops.pack([array_ops.shape(labels_flat)[0], -1]))    # 128*128
+    true_b = array_ops.slice(all_b, [0], array_ops.shape(labels_flat))
+
+    # inputs shape is [batch_size, dim]
+    # true_w shape is [batch_size * num_true, dim]
+    # row_wise_dots is [batch_size, num_true, dim]
+    dim = array_ops.shape(true_w)[1:2]
+    new_true_w_shape = array_ops.concat(0, [[-1, num_true], dim])
+    row_wise_dots = math_ops.mul(
+        array_ops.expand_dims(inputs, 1),                  # 128*1*128
+        array_ops.reshape(true_w, new_true_w_shape))       # 128*1*128
+    # We want the row-wise dot plus biases which yields a
+    # [batch_size, num_true] tensor of true_logits.
+    dots_as_matrix = array_ops.reshape(row_wise_dots,
+                                       array_ops.concat(0, [[-1], dim]))
+    true_logits = array_ops.reshape(_sum_rows(dots_as_matrix), [-1, num_true])
+    true_b = array_ops.reshape(true_b, [-1, num_true])
+    true_logits += true_b
+
+    # Lookup weights and biases for sampled labels.
+    #   sampled_w shape is [num_sampled, dim]
+    #   sampled_b is a [num_sampled] float tensor
+    sampled_w = array_ops.slice(
+        all_w, array_ops.pack([array_ops.shape(labels_flat)[0], 0]), [-1, -1])
+    sampled_b = array_ops.slice(all_b, array_ops.shape(labels_flat), [-1])
+
+    # inputs has shape [batch_size, dim]
+    # sampled_w has shape [num_sampled, dim]
+    # sampled_b has shape [num_sampled]
+    # Apply X*W'+B, which yields [batch_size, num_sampled]
+    sampled_logits = math_ops.matmul(
+        inputs, sampled_w, transpose_b=True) + sampled_b
+    if remove_accidental_hits:
+      acc_hits = candidate_sampling_ops.compute_accidental_hits(
+          labels, sampled, num_true=num_true)
+      acc_indices, acc_ids, acc_weights = acc_hits
+
+      # This is how SparseToDense expects the indices.
+      acc_indices_2d = array_ops.reshape(acc_indices, [-1, 1])
+      acc_ids_2d_int32 = array_ops.reshape(
+          math_ops.cast(acc_ids, dtypes.int32), [-1, 1])
+      sparse_indices = array_ops.concat(1, [acc_indices_2d, acc_ids_2d_int32],
+                                        "sparse_indices")
+      # Create sampled_logits_shape = [batch_size, num_sampled]
+      sampled_logits_shape = array_ops.concat(
+          0,
+          [array_ops.shape(labels)[:1], array_ops.expand_dims(num_sampled, 0)])
+      if sampled_logits.dtype != acc_weights.dtype:
+        acc_weights = math_ops.cast(acc_weights, sampled_logits.dtype)
+      sampled_logits += sparse_ops.sparse_to_dense(
+          sparse_indices,
+          sampled_logits_shape,
+          acc_weights,
+          default_value=0.0,
+          validate_indices=False)
+
+    if subtract_log_q:
+      # Subtract log of Q(l), prior probability that l appears in sampled.
+      true_logits -= math_ops.log(true_expected_count)
+      sampled_logits -= math_ops.log(sampled_expected_count)
+
+    # Construct output logits and labels. The true labels/logits start at col 0.
+    out_logits = array_ops.concat(1, [true_logits, sampled_logits])
+    # true_logits is a float tensor, ones_like(true_logits) is a float tensor
+    # of ones. We then divide by num_true to ensure the per-example labels sum
+    # to 1.0, i.e. form a proper probability distribution.
+    out_labels = array_ops.concat(1,
+                                  [array_ops.ones_like(true_logits) / num_true,
+                                   array_ops.zeros_like(sampled_logits)])
+  return out_logits, out_labels
+
+def _sum_rows(x):
+  """Returns a vector summing up each row of the matrix x."""
+  # _sum_rows(x) is equivalent to math_ops.reduce_sum(x, 1) when x is
+  # a matrix.  The gradient of _sum_rows(x) is more efficient than
+  # reduce_sum(x, 1)'s gradient in today's implementation. Therefore,
+  # we use _sum_rows(x) in the nce_loss() computation since the loss
+  # is mostly used for training.
+  cols = array_ops.shape(x)[1]
+  ones_shape = array_ops.pack([cols, 1])
+  ones = array_ops.ones(ones_shape, x.dtype)
+  return array_ops.reshape(math_ops.matmul(x, ones), [-1])
+
+def nce_loss(weights,
+             biases,
+             inputs,
+             labels,
+             num_sampled,
+             num_classes,
+             num_true=1,
+             sampled_values=None,
+             remove_accidental_hits=False,
+             partition_strategy="mod",
+             name="nce_loss"):
+  logits, labels = _compute_sampled_logits(
+      weights,
+      biases,
+      inputs,
+      labels,
+      num_sampled,
+      num_classes,
+      num_true=num_true,
+      sampled_values=sampled_values,
+      subtract_log_q=True,
+      remove_accidental_hits=remove_accidental_hits,
+      partition_strategy=partition_strategy,
+      name=name)
+  sampled_losses = sigmoid_cross_entropy_with_logits(logits, labels, name="sampled_losses")
+  # sampled_losses is batch_size x {true_loss, sampled_losses...}
+  # We sum out true and sampled losses.
+  return _sum_rows(sampled_losses)
+
+def sigmoid_cross_entropy_with_logits(logits, targets, name=None):
+  """Computes sigmoid cross entropy given `logits`.
+
+  Measures the probability error in discrete classification tasks in which each
+  class is independent and not mutually exclusive.  For instance, one could
+  perform multilabel classification where a picture can contain both an elephant
+  and a dog at the same time.
+
+  For brevity, let `x = logits`, `z = targets`.  The logistic loss is
+
+        z * -log(sigmoid(x)) + (1 - z) * -log(1 - sigmoid(x))
+      = z * -log(1 / (1 + exp(-x))) + (1 - z) * -log(exp(-x) / (1 + exp(-x)))
+      = z * log(1 + exp(-x)) + (1 - z) * (-log(exp(-x)) + log(1 + exp(-x)))
+      = z * log(1 + exp(-x)) + (1 - z) * (x + log(1 + exp(-x))
+      = (1 - z) * x + log(1 + exp(-x))
+      = x - x * z + log(1 + exp(-x))
+
+  For x < 0, to avoid overflow in exp(-x), we reformulate the above
+
+        x - x * z + log(1 + exp(-x))
+      = log(exp(x)) - x * z + log(1 + exp(-x))
+      = - x * z + log(1 + exp(x))
+
+  Hence, to ensure stability and avoid overflow, the implementation uses this
+  equivalent formulation
+
+      max(x, 0) - x * z + log(1 + exp(-abs(x)))
+
+  `logits` and `targets` must have the same type and shape.
+
+  Args:
+    logits: A `Tensor` of type `float32` or `float64`.
+    targets: A `Tensor` of the same type and shape as `logits`.
+    name: A name for the operation (optional).
+
+  Returns:
+    A `Tensor` of the same shape as `logits` with the componentwise
+    logistic losses.
+
+  Raises:
+    ValueError: If `logits` and `targets` do not have the same shape.
+  """
+  with ops.name_scope(name, "logistic_loss", [logits, targets]) as name:
+    logits = ops.convert_to_tensor(logits, name="logits")
+    targets = ops.convert_to_tensor(targets, name="targets")
+    try:
+      targets.get_shape().merge_with(logits.get_shape())
+    except ValueError:
+      raise ValueError("logits and targets must have the same shape (%s vs %s)"
+                       % (logits.get_shape(), targets.get_shape()))
+
+    # The logistic loss formula from above is
+    #   x - x * z + log(1 + exp(-x))
+    # For x < 0, a more numerically stable formula is
+    #   -x * z + log(1 + exp(x))
+    # Note that these two expressions can be combined into the following:
+    #   max(x, 0) - x * z + log(1 + exp(-abs(x)))
+    # To allow computing gradients at zero, we define custom versions of max and
+    # abs functions.
+    zeros = array_ops.zeros_like(logits, dtype=logits.dtype)
+    cond = (logits >= zeros)
+    relu_logits = math_ops.select(cond, logits, zeros)
+    neg_abs_logits = math_ops.select(cond, -logits, logits)
+    return math_ops.add(relu_logits - logits * targets,
+                        math_ops.log1p(math_ops.exp(neg_abs_logits)),
+                        name=name)
+
 
 # Step 1: Download the data.
 url = 'http://mattmahoney.net/dc/'
@@ -148,7 +393,7 @@ with graph.as_default():
     # Look up embeddings for inputs.
     embeddings = tf.Variable(
         tf.random_uniform([vocabulary_size, embedding_size], -1.0, 1.0))
-    embed = tf.nn.embedding_lookup(embeddings, train_inputs)
+    embed = tf.nn.embedding_lookup(embeddings, train_inputs)  # 128*128
 
     # Construct the variables for the NCE loss
     nce_weights = tf.Variable(
@@ -161,7 +406,7 @@ with graph.as_default():
   # time we evaluate the loss.
   # http://www.jianshu.com/p/fab82fa53e16
   loss = tf.reduce_mean(
-      tf.nn.nce_loss(weights=nce_weights,
+    nce_loss(weights=nce_weights,
                      biases=nce_biases,
                      labels=train_labels,
                      inputs=embed,
@@ -174,11 +419,11 @@ with graph.as_default():
   # Compute the cosine similarity between minibatch examples and all embeddings.
   norm = tf.sqrt(tf.reduce_sum(tf.square(embeddings), 1, keep_dims=True))
   normalized_embeddings = embeddings / norm
+  # cos similarity
   valid_embeddings = tf.nn.embedding_lookup(
       normalized_embeddings, valid_dataset)
   similarity = tf.matmul(
       valid_embeddings, normalized_embeddings, transpose_b=True)
-
   # Add variable initializer.
   init = tf.global_variables_initializer()
 
