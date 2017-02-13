@@ -233,9 +233,7 @@ def run_epoch(session, m, data, eval_op, verbose=False):
     iters += m.num_steps
 
     if verbose and step % (epoch_size // 10) == 10:
-      print("%.3f perplexity: %.3f speed: %.0f wps" %(step * 1.0 / epoch_size, np.exp(costs / iters),
-             iters * m.batch_size / (time.time() - start_time)))
-
+        print("%.3f perplexity: %.3f speed: %.0f wps" %(step * 1.0 / epoch_size, np.exp(costs / iters), iters * m.batch_size / (time.time() - start_time)))
   return np.exp(costs / iters)
 
 
